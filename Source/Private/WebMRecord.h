@@ -116,7 +116,11 @@ protected:
 	float VideoDeltaTimeAccum;
 	float TotalVideoTime;
 
+	bool bWriteYUVToTempFile;
 	TArray<FColor> VideoFrameTemp;
+	TArray<uint8> YPlaneTemp;
+	TArray<uint8> UPlaneTemp;
+	TArray<uint8> VPlaneTemp;
 	FArchive* VideoTempFile;
 	void OpenTempFrameFile();
 	void CloseTempFrameFile();

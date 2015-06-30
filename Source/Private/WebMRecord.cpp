@@ -46,6 +46,8 @@ FWebMRecord::FWebMRecord()
 	ReadbackBuffers[1] = nullptr;
 
 	VideoTempFile = nullptr;
+
+	bWriteYUVToTempFile = true;
 }
 
 void FWebMRecord::OnWorldCreated(UWorld* World, const UWorld::InitializationValues IVS)
@@ -176,7 +178,7 @@ void FWebMRecord::OnSlateWindowRenderedDuringCapture(SWindow& SlateWindow, void*
 		{
 			if (VideoDeltaTimeAccum >= VideoFrameDelay)
 			{
-				UE_LOG(LogUTWebM, Log, TEXT("Saving video frame %f"), VideoDeltaTimeAccum);
+				//UE_LOG(LogUTWebM, Log, TEXT("Saving video frame %f"), VideoDeltaTimeAccum);
 
 				SaveCurrentFrameToDisk();
 
@@ -212,10 +214,39 @@ void FWebMRecord::SaveCurrentFrameToDisk()
 		while (VideoDeltaTimeAccum >= VideoFrameDelay)
 		{
 			// Write this frame to disk
-			// could've written it in the above for loop to save one copy operation
 			if (VideoTempFile)
-			{
-				VideoTempFile->Serialize(ReadbackBuffers[ReadbackBufferIndex], VideoWidth * VideoHeight * sizeof(FColor));
+			{			
+				if (bWriteYUVToTempFile)
+				{
+					if (YPlaneTemp.Num() < VideoWidth * VideoHeight)
+					{
+						YPlaneTemp.Empty(VideoWidth * VideoHeight);
+						YPlaneTemp.AddZeroed(VideoWidth * VideoHeight);
+					}
+					if (UPlaneTemp.Num() < VideoWidth * VideoHeight / 4)
+					{
+						UPlaneTemp.Empty(VideoWidth * VideoHeight / 4);
+						UPlaneTemp.AddZeroed(VideoWidth * VideoHeight / 4);
+					}
+					if (VPlaneTemp.Num() < VideoWidth * VideoHeight / 4)
+					{
+						VPlaneTemp.Empty(VideoWidth * VideoHeight / 4);
+						VPlaneTemp.AddZeroed(VideoWidth * VideoHeight / 4);
+					}
+					// Use libyuv to convert from ARGB to YUV
+					libyuv::ARGBToI420((const uint8*)ReadbackBuffers[ReadbackBufferIndex], VideoWidth * 4,
+						YPlaneTemp.GetData(), VideoWidth,
+						UPlaneTemp.GetData(), VideoWidth / 2,
+						VPlaneTemp.GetData(), VideoWidth / 2, VideoWidth, VideoHeight);
+					
+					VideoTempFile->Serialize(YPlaneTemp.GetData(), VideoWidth * VideoHeight);
+					VideoTempFile->Serialize(UPlaneTemp.GetData(), VideoWidth * VideoHeight / 4);
+					VideoTempFile->Serialize(VPlaneTemp.GetData(), VideoWidth * VideoHeight / 4);
+				}
+				else
+				{
+					VideoTempFile->Serialize(ReadbackBuffers[ReadbackBufferIndex], VideoWidth * VideoHeight * sizeof(FColor));
+				}
 			}
 
 			// If we get hung, just write the same frame over so that audio will match
@@ -552,13 +583,23 @@ void FWebMRecord::EncodeVideoAndAudio()
 
 		while (!VideoTempFile->AtEnd())
 		{
-			VideoTempFile->Serialize(VideoFrameTemp.GetData(), VideoWidth * VideoHeight * sizeof(FColor));
+			if (bWriteYUVToTempFile)
+			{
+				VideoTempFile->Serialize(raw.planes[VPX_PLANE_Y], VideoWidth * VideoHeight);
+				VideoTempFile->Serialize(raw.planes[VPX_PLANE_U], VideoWidth * VideoHeight / 4);
+				VideoTempFile->Serialize(raw.planes[VPX_PLANE_V], VideoWidth * VideoHeight / 4);
+			}
+			else
+			{
+				// Just wrote raw rgb here
+				VideoTempFile->Serialize(VideoFrameTemp.GetData(), VideoWidth * VideoHeight * sizeof(FColor));
 
-			// Use libyuv to convert from ARGB to YUV
-			libyuv::ARGBToI420((const uint8*)VideoFrameTemp.GetData(), VideoWidth * 4,
-				raw.planes[VPX_PLANE_Y], raw.stride[VPX_PLANE_Y],
-				raw.planes[VPX_PLANE_U], raw.stride[VPX_PLANE_U],
-				raw.planes[VPX_PLANE_V], raw.stride[VPX_PLANE_V], VideoWidth, VideoHeight);
+				// Use libyuv to convert from ARGB to YUV
+				libyuv::ARGBToI420((const uint8*)VideoFrameTemp.GetData(), VideoWidth * 4,
+					raw.planes[VPX_PLANE_Y], raw.stride[VPX_PLANE_Y],
+					raw.planes[VPX_PLANE_U], raw.stride[VPX_PLANE_U],
+					raw.planes[VPX_PLANE_V], raw.stride[VPX_PLANE_V], VideoWidth, VideoHeight);
+			}
 
 			vpx_codec_encode(&codec, &raw, frame_cnt, 1, flags, VPX_DL_GOOD_QUALITY);
 			vpx_codec_iter_t iter = NULL;
