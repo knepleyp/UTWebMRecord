@@ -3,7 +3,8 @@
 #include "WebMRecord.h"
 #include "UnrealTournament.h"
 #include "UTPlayerController.h"
-
+#include "ModuleInterface.h"
+#include "Runtime/Core/Public/Features/IModularFeatures.h"
 #include "SlateBasics.h"
 #include "ScreenRendering.h"
 #include "RenderCore.h"
@@ -18,6 +19,10 @@
 
 #include <Avrt.h>
 
+#include "UTGameViewportClient.h"
+
+IMPLEMENT_MODULE(FWebMRecord, WebMRecord)
+
 DEFINE_LOG_CATEGORY_STATIC(LogUTWebM, Log, All);
 
 AWebMRecord::AWebMRecord(const FObjectInitializer& ObjectInitializer)
@@ -28,9 +33,9 @@ AWebMRecord::AWebMRecord(const FObjectInitializer& ObjectInitializer)
 FWebMRecord::FWebMRecord()
 {
 	bRecording = false;
-
-	VideoWorld = nullptr;
-
+	bCompressing = false;
+	bCompressionComplete = false;
+	
 	VideoWidth = 1280;
 	VideoHeight = 720;
 
@@ -38,6 +43,7 @@ FWebMRecord::FWebMRecord()
 	VideoFrameDelay = 1.0f / VideoFrameRate;
 	VideoDeltaTimeAccum = 0;
 	TotalVideoTime = 0;
+	TimeLeftToRecord = -1;
 
 	bRegisteredSlateDelegate = false;
 	ReadbackTextureIndex = 0;
@@ -48,6 +54,22 @@ FWebMRecord::FWebMRecord()
 	VideoTempFile = nullptr;
 
 	bWriteYUVToTempFile = true;
+}
+
+void FWebMRecord::StartupModule()
+{
+	FWorldDelegates::FWorldInitializationEvent::FDelegate OnWorldCreatedDelegate = FWorldDelegates::FWorldInitializationEvent::FDelegate::CreateRaw(this, &FWebMRecord::OnWorldCreated);
+	FDelegateHandle OnWorldCreatedDelegateHandle = FWorldDelegates::OnPostWorldInitialization.Add(OnWorldCreatedDelegate);
+
+	IModularFeatures::Get().RegisterModularFeature(TEXT("VideoRecording"), this);
+}
+
+void FWebMRecord::ShutdownModule()
+{
+	IModularFeatures::Get().UnregisterModularFeature(TEXT("VideoRecording"), this);
+
+	FWorldDelegates::FWorldEvent::FDelegate OnWorldDestroyedDelegate = FWorldDelegates::FWorldEvent::FDelegate::CreateRaw(this, &FWebMRecord::OnWorldDestroyed);
+	FDelegateHandle OnWorldDestroyedDelegateHandle = FWorldDelegates::OnPreWorldFinishDestroy.Add(OnWorldDestroyedDelegate);
 }
 
 void FWebMRecord::OnWorldCreated(UWorld* World, const UWorld::InitializationValues IVS)
@@ -95,17 +117,15 @@ void FWebMRecord::OnWorldDestroyed(UWorld* World)
 		return;
 	}
 
-	if (VideoWorld == World)
-	{
-		// :( something destroyed the world that we were recording
-	}
+	// Might want to track if the world we're recording just got destroyed, but really doesn't stop this train
 }
 
-void FWebMRecord::StartRecording()
+void FWebMRecord::StartRecording(float RecordTime)
 {
 	bRecording = true;
 	VideoDeltaTimeAccum = VideoFrameDelay;
 	TotalVideoTime = 0;
+	TimeLeftToRecord = RecordTime;
 
 	VideoFramesCaptured = 0;
 
@@ -125,6 +145,8 @@ void FWebMRecord::StopRecording()
 	AudioWorker->WaitForCompletion();
 
 	UE_LOG(LogUTWebM, Log, TEXT("Recording finished, %f seconds, %d video frames"), TotalVideoTime, VideoFramesCaptured);
+
+	OnRecordingCompleteEvent.Broadcast();
 }
 
 bool FWebMRecord::Exec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
@@ -133,7 +155,7 @@ bool FWebMRecord::Exec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 	{
 		if (!bRecording)
 		{
-			StartRecording();
+			StartRecording(-1);
 		}
 		else
 		{
@@ -145,8 +167,14 @@ bool FWebMRecord::Exec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 	// DEBUG: test muxing the audio and video from raw source
 	else if (FParse::Command(&Cmd, TEXT("VIDEOMUX")))
 	{
-		EncodeVideoAndAudio();
+		EncodeVideoAndAudio(TEXT(""));
 
+		return true;
+	}
+	// DEBUG: upload the last video written to youtube
+	else if (FParse::Command(&Cmd, TEXT("UPLOADVIDEO")))
+	{
+		DebugUploadLastVideo(InWorld);
 		return true;
 	}
 
@@ -164,6 +192,24 @@ void FWebMRecord::Tick(float DeltaTime)
 	{
 		VideoDeltaTimeAccum += DeltaTime;
 		TotalVideoTime += DeltaTime;
+
+		if (TimeLeftToRecord > 0)
+		{
+			TimeLeftToRecord -= DeltaTime;
+			if (TimeLeftToRecord <= 0)
+			{
+				StopRecording();
+			}
+		}
+	}
+
+	if (bCompressing)
+	{
+		if (bCompressionComplete)
+		{
+			bCompressing = false;
+			OnCompressingComplete().Broadcast();
+		}
 	}
 }
 
@@ -436,22 +482,31 @@ void FWebMRecord::MakeAudioPrivateData(const ogg_packet& header, const ogg_packe
 	FMemory::Memcpy(HeaderIterator, header_code.packet, header_code.bytes);
 }
 
-void FWebMRecord::EncodeVideoAndAudio()
+void FWebMRecord::EncodeVideoAndAudio(const FString& Filename)
 {
+	
 	// Pick a proper filename for the video
 	FString BasePath = FPaths::ScreenShotDir();
 	FString WebMPath = BasePath / TEXT("anim.webm");
-	static int32 WebMIndex = 0;
-	const int32 MaxTestWebMIndex = 65536;
-	for (int32 TestWebMIndex = WebMIndex + 1; TestWebMIndex < MaxTestWebMIndex; ++TestWebMIndex)
+
+	if (Filename.IsEmpty())
 	{
-		const FString TestFileName = BasePath / FString::Printf(TEXT("UTSelfie%05i.webm"), TestWebMIndex);
-		if (IFileManager::Get().FileSize(*TestFileName) < 0)
+		static int32 WebMIndex = 0;
+		const int32 MaxTestWebMIndex = 65536;
+		for (int32 TestWebMIndex = WebMIndex + 1; TestWebMIndex < MaxTestWebMIndex; ++TestWebMIndex)
 		{
-			WebMIndex = TestWebMIndex;
-			WebMPath = TestFileName;
-			break;
+			const FString TestFileName = BasePath / FString::Printf(TEXT("UTSelfie%05i.webm"), TestWebMIndex);
+			if (IFileManager::Get().FileSize(*TestFileName) < 0)
+			{
+				WebMIndex = TestWebMIndex;
+				WebMPath = TestFileName;
+				break;
+			}
 		}
+	}
+	else
+	{
+		WebMPath = Filename;
 	}
 
 	// Open the file for writing
@@ -513,6 +568,13 @@ void FWebMRecord::EncodeVideoAndAudio()
 	// Open up our cached frame captures for reading
 	FString TempFramesSavePath = FPaths::GameSavedDir() / TEXT("frames.raw");
 	VideoTempFile = IFileManager::Get().CreateFileReader(*TempFramesSavePath);
+	int64 FileSize = IFileManager::Get().FileSize(*TempFramesSavePath);
+
+	int32 TotalFrameCount = FileSize / (VideoHeight * VideoWidth * sizeof(FColor));
+	if (bWriteYUVToTempFile)
+	{
+		TotalFrameCount = FileSize / (VideoWidth * VideoHeight + VideoWidth * VideoHeight / 4 + VideoWidth * VideoHeight / 4);
+	}
 
 	// Open up our cached wave file for reading
 	FString WavePath = FPaths::GameSavedDir() / TEXT("audio.wav");
@@ -578,6 +640,7 @@ void FWebMRecord::EncodeVideoAndAudio()
 
 	if (VideoTempFile)
 	{
+		TArray<FColor> VideoFrameTemp;
 		VideoFrameTemp.Empty(VideoWidth * VideoHeight);
 		VideoFrameTemp.AddZeroed(VideoHeight * VideoWidth);
 
@@ -615,6 +678,8 @@ void FWebMRecord::EncodeVideoAndAudio()
 					break;
 				}
 			}
+
+			CompressionCompletionPercent = (float)frame_cnt / (float)TotalFrameCount;
 
 			frame_cnt++;
 			VideoTimeStamp = ebml.last_pts_ns;
@@ -744,6 +809,32 @@ void FWebMRecord::EncodeVideoAndAudio()
 	fclose(file);
 
 	UE_LOG(LogUTWebM, Display, TEXT("Selfie video complete! %s"), *WebMPath);
+}
+
+void FWebMRecord::DebugUploadLastVideo(UWorld* InWorld)
+{
+	// Find the last good one
+	FString BasePath = FPaths::ScreenShotDir();
+	FString WebMPath = BasePath / TEXT("anim.webm");
+	const int32 MaxTestWebMIndex = 65536;
+	for (int32 TestWebMIndex = 1; TestWebMIndex < MaxTestWebMIndex; ++TestWebMIndex)
+	{
+		const FString TestFileName = BasePath / FString::Printf(TEXT("UTSelfie%05i.webm"), TestWebMIndex);
+		if (IFileManager::Get().FileSize(*TestFileName) > 0)
+		{
+			WebMPath = TestFileName;
+		}
+		else
+		{
+			break;
+		}
+	}
+
+#if !UE_SERVER
+	UUTLocalPlayer* FirstPlayer = Cast<UUTLocalPlayer>(GEngine->GetLocalPlayerFromControllerId(InWorld, 0));
+	FirstPlayer->RecordedReplayFilename = WebMPath;
+	FirstPlayer->UploadVideoToYoutube();
+#endif
 }
 
 void FWebMRecord::DebugWriteAudioToOGG()
@@ -1188,4 +1279,30 @@ void FCaptureAudioWorker::StopAudioLoopback()
 		MMDevice->Release();
 		MMDevice = nullptr;
 	}
+}
+
+void FWebMRecord::StartCompressing(const FString& Filename)
+{
+	bCompressing = true;
+	CompressionCompletionPercent = 0;
+	FCompressVideoWorker::RunWorkerThread(this, Filename);
+}
+
+FCompressVideoWorker* FCompressVideoWorker::Runnable = nullptr;
+
+FCompressVideoWorker::FCompressVideoWorker(FWebMRecord* InWebMRecorder, const FString& InFilename)
+{
+	WebMRecorder = InWebMRecorder;
+	Filename = InFilename;
+
+	// This needs to be last or you get race conditions with ::Run()
+	Thread = FRunnableThread::Create(this, TEXT("FCompressVideoWorker"), 0, TPri_Highest);
+}
+
+uint32 FCompressVideoWorker::Run()
+{
+	WebMRecorder->EncodeVideoAndAudio(Filename);
+	WebMRecorder->bCompressionComplete = true;
+
+	return 0;
 }

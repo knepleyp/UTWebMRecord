@@ -9,6 +9,8 @@
 #include <audioclient.h>
 #include <mmsystem.h>
 
+#include "UTVideoRecordingFeature.h"
+
 // Vorbis would like special alignment
 #pragma pack(push, 8)
 #include "vorbis/vorbisenc.h"
@@ -82,12 +84,17 @@ public:
 	}
 };
 
-struct FWebMRecord : FTickableGameObject, FSelfRegisteringExec
+struct FWebMRecord : FTickableGameObject, FSelfRegisteringExec, UTVideoRecordingFeature, IModuleInterface
 {
+public:
+	virtual void StartupModule() override;
+	virtual void ShutdownModule() override;
+
 	FWebMRecord();
 	virtual void Tick(float DeltaTime);
 	virtual bool IsTickable() const { return true; }
 	virtual bool IsTickableInEditor() const { return true; }
+	virtual bool IsTickableWhenPaused() const { return true; }
 
 	// Put a real stat id here
 	virtual TStatId GetStatId() const
@@ -101,12 +108,40 @@ struct FWebMRecord : FTickableGameObject, FSelfRegisteringExec
 	void OnWorldCreated(UWorld* World, const UWorld::InitializationValues IVS);
 	void OnWorldDestroyed(UWorld* World);
 	
-	void StartRecording();
+	virtual void StartRecording(float RecordTime) override;
+	virtual void CancelRecording() override
+	{
+		StopRecording();
+	}
+
 	void StopRecording();
+
+	FRecordingComplete OnRecordingCompleteEvent;
+	virtual FRecordingComplete& OnRecordingComplete() override
+	{
+		return OnRecordingCompleteEvent;
+	}
+
+	FCompressingComplete OnCompressingCompleteEvent;
+	virtual FCompressingComplete& OnCompressingComplete() override
+	{
+		return OnCompressingCompleteEvent;
+	}
+
+	virtual void StartCompressing(const FString& Filename) override;
+
+	float CompressionCompletionPercent;
+	virtual float GetCompressionCompletionPercent() override
+	{
+		return CompressionCompletionPercent;
+	}
+
+	bool bCompressionComplete;
+	void EncodeVideoAndAudio(const FString& Filename);
+
 protected:
 	bool bRecording;
-
-	UWorld* VideoWorld;
+	bool bCompressing;
 
 	int32 VideoWidth;
 	int32 VideoHeight;
@@ -115,9 +150,9 @@ protected:
 	float VideoFrameDelay;
 	float VideoDeltaTimeAccum;
 	float TotalVideoTime;
+	float TimeLeftToRecord;
 
 	bool bWriteYUVToTempFile;
-	TArray<FColor> VideoFrameTemp;
 	TArray<uint8> YPlaneTemp;
 	TArray<uint8> UPlaneTemp;
 	TArray<uint8> VPlaneTemp;
@@ -140,8 +175,7 @@ protected:
 	bool bRegisteredSlateDelegate;
 
 	FCaptureAudioWorker* AudioWorker;
-
-	void EncodeVideoAndAudio();
+	class FCompressVideoWorker* CompressWorker;
 	
 	// Returns a buffer that you must delete [] later
 	void MakeAudioPrivateData(const ogg_packet& header, const ogg_packet& header_comm, const ogg_packet& header_code, uint8** AudioHeader, uint64& AudioHeaderLength);
@@ -149,12 +183,45 @@ protected:
 	void XiphLace(uint8** BufferToLaceInto, uint64 ValueToLace);
 
 	void DebugWriteAudioToOGG();
+	void DebugUploadLastVideo(UWorld* InWorld);
 };
 
 
-class FWebMRecordPlugin : public IModuleInterface
+class FCompressVideoWorker : public FRunnable
 {
-	/** IModuleInterface implementation */
-	virtual void StartupModule() override;
-	virtual void ShutdownModule() override;
+	FCompressVideoWorker(FWebMRecord* InWebMRecorder, const FString& InFilename);
+
+	~FCompressVideoWorker()
+	{
+		delete Thread;
+		Thread = nullptr;
+	}
+
+	uint32 Run();
+
+public:
+	bool bStopCapture;
+
+	void WaitForCompletion()
+	{
+		Thread->WaitForCompletion();
+	}
+
+	static FCompressVideoWorker* RunWorkerThread(FWebMRecord* InWebMRecorder, const FString& InFilename)
+	{
+		if (Runnable)
+		{
+			delete Runnable;
+			Runnable = nullptr;
+		}
+
+		Runnable = new FCompressVideoWorker(InWebMRecorder, InFilename);
+
+		return Runnable;
+	}
+private:
+	FRunnableThread* Thread;
+	FWebMRecord* WebMRecorder;
+	FString Filename;
+	static FCompressVideoWorker* Runnable;
 };
