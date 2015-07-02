@@ -129,6 +129,7 @@ public:
 	}
 
 	virtual void StartCompressing(const FString& Filename) override;
+	virtual void CancelCompressing() override;
 
 	float CompressionCompletionPercent;
 	virtual float GetCompressionCompletionPercent() override
@@ -136,6 +137,7 @@ public:
 		return CompressionCompletionPercent;
 	}
 
+	bool bCancelCompressing;
 	bool bCompressionComplete;
 	void EncodeVideoAndAudio(const FString& Filename);
 

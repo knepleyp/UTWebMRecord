@@ -35,6 +35,8 @@ FWebMRecord::FWebMRecord()
 	bRecording = false;
 	bCompressing = false;
 	bCompressionComplete = false;
+	bCancelCompressing = false;
+	CompressWorker = nullptr;
 	
 	VideoWidth = 1280;
 	VideoHeight = 720;
@@ -644,7 +646,7 @@ void FWebMRecord::EncodeVideoAndAudio(const FString& Filename)
 		VideoFrameTemp.Empty(VideoWidth * VideoHeight);
 		VideoFrameTemp.AddZeroed(VideoHeight * VideoWidth);
 
-		while (!VideoTempFile->AtEnd())
+		while (!VideoTempFile->AtEnd() && !bCancelCompressing)
 		{
 			if (bWriteYUVToTempFile)
 			{
@@ -1284,8 +1286,20 @@ void FCaptureAudioWorker::StopAudioLoopback()
 void FWebMRecord::StartCompressing(const FString& Filename)
 {
 	bCompressing = true;
+	bCompressionComplete = false;
+	bCancelCompressing = false;
 	CompressionCompletionPercent = 0;
-	FCompressVideoWorker::RunWorkerThread(this, Filename);
+	CompressWorker = FCompressVideoWorker::RunWorkerThread(this, Filename);
+}
+
+void FWebMRecord::CancelCompressing()
+{
+	bCancelCompressing = true;
+	if (CompressWorker)
+	{
+		CompressWorker->WaitForCompletion();
+	}
+	bCompressing = false;
 }
 
 FCompressVideoWorker* FCompressVideoWorker::Runnable = nullptr;
